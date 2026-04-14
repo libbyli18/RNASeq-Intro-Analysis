@@ -1,0 +1,371 @@
+---
+title: "RNAseq Intro Analysis"
+author: "Libby Li"
+date: "2026-03-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+counts = na.omit(read.table(file = "gene_counts.tsv", sep = '\t', header = TRUE))
+```
+
+Experiment:
+Macrophages were either trained with (phosphate-buffered saline, a control) or interferon-gamma (IFNy, a cytokine) for 24 hours. IFNy-treated cells represent an initial infection. The overarching goal of this analysis is to explore innate immune memory and see how cells that have encountered an infection in the past respond to future infections differently than cells that haven't.
+
+Next, ALL macrophages were stimulated with LPS (Lipopolysaccharide, a molecule that triggers immune system activation including macrophages) and left to grow 12 hours. This functions as a "secondary infection."
+
+Conditions we'll focus on:
+D0_unstim -- baseline expression for PBS-treated macrophages
+D0_y100_8H -- acute (as in immediate) expression of IFNy-treated macrophages
+
+y0_LPS0H -- expression for macrophages treated with PBS for 24 hours and then stimulated with LPS (immediate, 0H)
+y0_LPS1H -- expression for macrophages treated with PBS for 24 hours after 1 hour post-LPS stimulation
+y0_LPS3H -- expression for macrophages treated with PBS for 24 hours after 3 hours post-LPS stimulation
+y0_LPS6H -- expression for macrophages treated with PBS for 24 hours after 6 hours post-LPS stimulation
+y0_LPS12H -- expression for macrophages treated with PBS for 24 hours after 12 hours post-LPS stimulation
+
+y100_LPS0H -- expression for macrophages treated with IFNy for 24 hours and then stimulated with LPS (immediate, 0H)
+y100_LPS1H -- expression for macrophages treated with IFNy for 24 hours after 1 hour post-LPS stimulation
+y100_LPS3H -- expression for macrophages treated with IFNy for 24 hours after 3 hours post-LPS stimulation
+y100_LPS6H -- expression for macrophages treated with IFNy for 24 hours after 6 hours post-LPS stimulation
+y100_LPS12H -- expression for macrophages treated with IFNy for 24 hours after 12 hours post-LPS stimulation
+
+
+```{r}
+## First subset counts to only include GeneID and the conditions of interest
+counts <- counts[, c("Geneid", "D0_unstim", "D0_y100_8H", "y0_LPS0H", "y0_LPS1H", "y0_LPS3H", "y0_LPS6H", "y0_LPS12H", "y100_LPS0H", "y100_LPS1H", "y100_LPS3H",  "y100_LPS6H", "y100_LPS12H")]
+```
+
+```{r}
+##Create a new column called "Gene_Symbol" that maps each Ensembl Gene ID (found in "GeneID") to its correspondong gene symbol (the gene names we're used to seeing)
+
+# there are several ways to do this. one way is to use the biomArt package. if it's not already installed, install it in the R console with BioCManager:
+
+#if (!require("BiocManager", quietly = TRUE))
+    #install.packages("BiocManager")
+
+#install.packages("biomaRt")
+library(biomaRt)
+
+# next, we connect to Ensembl, an external data source from the web that can help us with this mapping
+mart <- useEnsembl("ensembl",
+  dataset = "hsapiens_gene_ensembl",
+  mirror = "useast"  # try "asia", "www", "useast"
+)
+
+# our dataset's geneid's have version numbers, which aren't compatible with ensemble, so we need to clean them and remove the version numbers (ie, everything after the .):
+gene_ids <- counts$Geneid
+gene_ids_clean <- gsub("\\..*", "", gene_ids)
+
+# getBM() will give us the external dataset that maps ensemble ID to HGNC Symbol (what we want)
+mapping <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = gene_ids_clean,
+  mart = mart
+)
+
+
+counts$Gene_Symbol <- gene_ids_clean # create the gene symbol column, initially just copy over the ensemble ID's as placeholder
+
+id_to_symbol <- setNames(mapping$hgnc_symbol, mapping$ensembl_gene_id) # this is essentially a dictionary that maps each ensemble_ID to a gene symbol
+
+counts$Gene_Symbol <- id_to_symbol[gene_ids_clean] # replace ensemble ID's in Gene_Symbol with the actual symbol now
+
+```
+
+
+
+```{r}
+## data cleaning
+# ensemble ID <--> gene symbol mapping is never perfect. there are many genes (like pseudogenes, noncoding RNA that have an ensemble ID but no gene symbol associated with them). Therefore, you'll notice the gene symbol column has several blanks or NA's.
+
+# typically, we are not interested in these, so it's okay to drop these values.
+
+# 1) drop rows that have no gene symbol associated with them
+counts <- counts[counts$Gene_Symbol != "", ]
+
+# 2) it's commom practice to make to make the counts table completely numeric as this will help with several mathematical operations later. now that we have gene symbols, you can drop the GeneID column
+counts$Geneid <- NULL
+
+# 3) next, make the rownames of the counts table the gene symbol. you might need to check for duplicated symbols before making them the rownames. while there are better ways to deal with these, for now remove any duplicates before making the symbols the rownames
+counts <- na.omit(counts)
+counts <- counts[!duplicated(counts$Gene_Symbol), ]
+rownames(counts) <- counts$Gene_Symbol
+
+# 4) finally, drop the gene symbol column because the information is now preserved in the row names.
+counts$Gene_Symbol <- NULL
+
+```
+
+
+```{r}
+## at this point, you should have lost ~20000 genes (you should have around 41000 observations). the row names should be the gene symbols, and the columns should only include the conditions of interest listed at the beginning
+
+# next, it's good practice to inspect the data visually. make a histogram of the counts. there will be a few outliers making the graph look very weird, so play around with the scaling, number of breaks, and the limits of the x axis to see what the distribution of the bulk of the counts look like. 
+x <- as.matrix(counts)
+x <- x[x > 0]
+
+hist(x,
+     main = "Non-zero counts",
+     xlab = "Counts",
+     breaks = 10000, xlim=c(0,5000))
+```
+
+
+```{r}
+# next, we should filter out low counts genes from the dataset. from the histogram, you would probably see a HUGE spike at counts 0. a good number of genes (nearly half) are irrelevant to macrophages and should see incredibly low counts across all genes that are mostly just noise. we want to remove these genes from our analysis
+
+# there are several ways to filter the dataset, and we often change the method depending on the dataset. 
+
+# a simple way is to keep only genes that have counts >5 in at least 1 sample (note this 5 is an arbitrary choice and can differ based on the dataset).
+
+# another option that I like to do that doesn't rely on an arbitrary cutoff is to require a gene to be above the 50th percentile in at least 1 condition in order to stay. essentially, we check the percentile of each gene separately for each condition, and we check if it exceeds the median at least in one condition. this tells us that something happens to the gene at some point during our conditions of interest.
+
+# that said, the percentile metric can run into some issues. in many conditions (if not all), the 50th percentile would be 0. if you do this method, you'll filter out genes with all 0's, but you may still be left with genes that look like 1 0 0 1 2 1 0 which are still uninformative. to deal with this, a good option is to employ both filtering metrics listed above. let's try doing that here: 
+
+# in order for a gene to stay, it must:
+# a) be above the 50th percentile in at least 2 condition
+counts.full <- counts
+threshold <- apply(counts, 2, quantile, 0.5)
+keep <- apply(counts, 1, function(row) any(row > threshold))
+counts <- counts[keep, ]
+# and b) have counts >5 in at least one condition
+keep <- apply(counts, 1, function(row) any(row > 5))
+counts <- counts[keep,]
+# note: make sure to do the percentile filtering before the >5; if you filter for >5 first, you'll lose a lot of low counts genes already, and the new 50th percentile would be very high, which would be too aggressive as an additional filtering.
+
+
+# you should be left with about 17-20000 genes. i've found this quite typical after filtering.
+```
+
+
+
+
+```{r}
+# now that filtering is complete, it is time to normalize the data. Raw RNA-seq counts can’t be compared directly between samples because each sample might have been sequenced to a different depth — some samples might have more total reads simply because of sequencing variability.
+
+# normalization adjusts for these differences so that we can fairly compare gene expression across samples.
+
+# using the edgeR package, create a DGElist object using the filtered counts. then use the cpm function to compute the CPM table.
+library(edgeR)
+conditions <- c("D0_unstim", "D0_y100_8H", "y0_LPS0H", "y0_LPS1H", "y0_LPS3H", "y0_LPS6H", "y0_LPS12H", "y100_LPS0H", "y100_LPS1H", "y100_LPS3H",  "y100_LPS6H", "y100_LPS12H")
+d <- DGEList(counts, group=factor(conditions))
+d
+
+cpm(d)
+
+
+# fyi: while the CPM function does this for you, the logic is very simple. for each column (ie, each sample), we get the sum of all counts to get the total sequencing depth of that sample. we then compute each gene's CPM value as the gene's counts divided by the total sequencing depth of that sample, multiplied by 10^6 (a large constant since we'd be dealing with very tiny values otherwise). this is computed separately for each sample.
+
+# plot a histogram of CPM values. like earlier, adjust the scaling and axis limits to deal with the large variance
+x <- as.matrix(cpm(d))
+x <- x[x > 0]
+
+hist(log10(x),
+     main = "Log10 Normalized Counts",
+     xlab = "Log10 Counts (in cpm)",
+     breaks = 10000
+     )
+
+```
+
+2 plots
+1) PCA of all genes, CPM --> x axis=PC1, y axis=PC2, 19 points, 1 point for each condition
+2) PCA of the top 5000 variable genes --> same axes
+```{r}
+# 1)
+cpm_matrix <- cpm(d,
+                  log = FALSE
+                  )
+log_cpm_matrix <- cpm(d, log=TRUE)
+pca <- prcomp(t(cpm_matrix))
+pca_df <- data.frame(
+  PC1 = pca$x[,1],
+  PC2 = pca$x[,2],
+  condition = colnames(cpm_matrix)
+)
+
+library(ggplot2)
+library(ggrepel)
+pca_all <- prcomp(t(cpm_matrix), scale. = TRUE)
+
+pca_all_df <- data.frame(
+PC1 = pca_all$x[,1],
+PC2 = pca_all$x[,2],
+Sample = colnames(cpm_matrix)
+)
+
+# Plot
+
+ggplot(pca_all_df, aes(x = PC1, y = PC2, label = Sample)) +
+geom_point(size = 3) +
+geom_text_repel(size = 3) +
+labs(title = "PCA - All Genes",
+x = "PC1",
+y = "PC2") +
+theme_minimal()
+
+gene_var <- apply(cpm_matrix, 1, var)
+top5000 <- names(sort(gene_var, decreasing = TRUE))[1:5000]
+
+cpm_top <- cpm_matrix[top5000, ]
+pca_top <- prcomp(t(cpm_top), scale. = TRUE)
+
+pca_top_df <- data.frame(
+PC1 = pca_top$x[,1],
+PC2 = pca_top$x[,2],
+Sample = colnames(cpm_top)
+)
+
+# Plot for top5k var genes
+
+# Condition: color
+
+pca_top_df$Condition <- ifelse(grepl("y100", pca_top_df$Sample), "IFNy_trained", "PBS_trained")
+
+# Define Phase: D0 vs LPS
+
+pca_top_df$Phase <- ifelse(grepl("^D0", pca_top_df$Sample), "Training", "LPS Timecourse")
+
+# Time for size mapping: D0 = single size, LPS = varying sizes
+
+pca_top_df$Time <- ifelse(pca_top_df$Phase == "Training", "D0", sub(".*LPS", "LPS", pca_top_df$Sample))
+pca_top_df$Time <- factor(pca_top_df$Time, levels = c("D0", "LPS0H", "LPS1H", "LPS3H", "LPS6H", "LPS12H"))
+
+# Plot
+
+ggplot(pca_top_df, aes(x = PC1, y = PC2, color = Condition, shape = Phase, size = Time, label = Sample)) +
+geom_point() +
+geom_text_repel(size = 3) +
+scale_shape_manual(values = c(16, 17)) +           # 16=solid circle for Training, 17=triangle for LPS
+scale_size_manual(values = c(3, 3, 4, 5, 6, 7)) +  # D0 small, LPS increases
+labs(title = "PCA - Top 5000 Variable Genes",
+x = "PC1",
+y = "PC2",
+color = "Condition",
+shape = "Phase",
+size = "Time Point") +
+theme_minimal()
+```
+
+```{r}
+# ── 0. Setup: LPS-only CPM subsets ───────────────────────────────────────────
+
+lps_cols_y0   <- c("y0_LPS0H",   "y0_LPS1H",   "y0_LPS3H",   "y0_LPS6H",   "y0_LPS12H")
+lps_cols_y100 <- c("y100_LPS0H", "y100_LPS1H", "y100_LPS3H", "y100_LPS6H", "y100_LPS12H")
+lps_timepoints <- c("0H", "1H", "3H", "6H", "12H")
+
+cpm_lps_y0   <- cpm_matrix[, lps_cols_y0]
+cpm_lps_y100 <- cpm_matrix[, lps_cols_y100]
+
+
+# ── 1. Inspect CPM table & pick 3 exploratory genes ──────────────────────────
+
+# Quick look: sort genes by how different y0 vs y100 peak CPM is
+peak_diff <- apply(cpm_lps_y100, 1, max) - apply(cpm_lps_y0, 1, max)
+head(sort(peak_diff, decreasing = TRUE), 20)   # top 20 candidates
+
+# Pick 3 that look interesting from the printout, e.g.:
+exploratory_genes <- c("IFIT1", "MX1", "CCL5")   # <-- swap in whatever catches your eye
+
+
+# ── 2. Reusable line-plot function ───────────────────────────────────────────
+
+plot_gene_lps <- function(gene, cpm_mat = cpm_matrix) {
+  
+  y0_vals   <- as.numeric(cpm_mat[gene, lps_cols_y0])
+  y100_vals <- as.numeric(cpm_mat[gene, lps_cols_y100])
+  
+  df <- data.frame(
+    Time      = factor(rep(lps_timepoints, 2),
+                       levels = lps_timepoints),
+    CPM       = c(y0_vals, y100_vals),
+    Condition = rep(c("PBS_trained (y0)", "IFNy_trained (y100)"), each = 5)
+  )
+  
+  ggplot(df, aes(x = Time, y = CPM, color = Condition, group = Condition)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    scale_color_manual(values = c("PBS_trained (y0)" = "blue",
+                                  "IFNy_trained (y100)" = "red")) +
+    labs(title = paste("LPS Timecourse –", gene),
+         x = "Time post-LPS",
+         y = "CPM",
+         color = "Condition") +
+    theme_minimal()
+}
+
+
+# ── 3. Plot the 3 exploratory genes + IRF1, GBP5, CXCL10 ────────────────────
+
+all_genes_to_plot <- c(exploratory_genes, "IRF1", "GBP5", "CXCL10")
+
+for (g in all_genes_to_plot) {
+  print(plot_gene_lps(g))
+}
+
+
+# ── 4. Potentiated gene methods ───────────────────────────────────────────────
+
+# Method 1 ─ y100 > y0 by ≥2x in at least 1 timepoint
+pot_method1 <- rownames(cpm_matrix)[apply(
+  cpm_lps_y100 / (cpm_lps_y0 + 1),   # +1 avoids divide-by-zero
+  1,
+  function(row) any(row >= 2)
+)]
+
+# Method 2 ─ at the peak timepoint of each condition, y100_peak >= 2x y0_peak
+peak_y0   <- apply(cpm_lps_y0,   1, max)
+peak_y100 <- apply(cpm_lps_y100, 1, max)
+
+pot_method2 <- names(peak_y100)[peak_y100 >= 2 * peak_y0]
+
+# Method 3 ─ y100 > y0 by ≥2x in at least 2 *consecutive* timepoints
+consec_2x <- function(row_ratio) {
+  # row_ratio: named vector of length 5, one value per timepoint
+  above <- row_ratio >= 2
+  # check for any run of 2+ consecutive TRUEs
+  any(diff(which(above)) == 1)
+}
+
+ratio_mat <- cpm_lps_y100 / (cpm_lps_y0 + 1)
+
+pot_method3 <- rownames(ratio_mat)[apply(ratio_mat, 1, consec_2x)]
+
+
+# ── 5. Counts ────────────────────────────────────────────────────────────────
+
+cat("Method 1 (≥2x in any 1 timepoint):          ", length(pot_method1), "genes\n")
+cat("Method 2 (peak y100 ≥ 2x peak y0):          ", length(pot_method2), "genes\n")
+cat("Method 3 (≥2x in ≥2 consecutive timepoints):", length(pot_method3), "genes\n")
+
+
+# ── 6. Example plot for each method ──────────────────────────────────────────
+
+# Pick a strong example from each set: gene with highest max ratio
+pick_example <- function(geneset) {
+  ratios <- apply(ratio_mat[geneset, ], 1, max)
+  names(which.max(ratios))
+}
+
+ex1 <- pick_example(pot_method1)
+ex2 <- pick_example(pot_method2)
+ex3 <- pick_example(pot_method3)
+
+cat("\nExample genes:\n")
+cat("  Method 1:", ex1, "\n")
+cat("  Method 2:", ex2, "\n")
+cat("  Method 3:", ex3, "\n")
+
+print(plot_gene_lps(ex1) + labs(subtitle = "Method 1 example"))
+print(plot_gene_lps(ex2) + labs(subtitle = "Method 2 example"))
+print(plot_gene_lps(ex3) + labs(subtitle = "Method 3 example"))
+```
+
+
+
